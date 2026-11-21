@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import os
+import sqlite3
 import tempfile
 import unittest
 import unittest.mock
@@ -14,6 +15,8 @@ import unittest.mock
 from lake_archive import archive as store
 from lake_archive import csvio
 from lake_archive.web import create_app
+
+store_connect = store.connect   # the unpatched entry point, for test proxies
 
 CSV = b"""seq,sampled_at_utc,value_millidegrees_c,kind,base_seq
 1,2024-01-01T00:00:00Z,-1500,absolute,
@@ -74,6 +77,66 @@ class TestImport(Base):
     def test_duplicate_name_rejected(self):
         with self.assertRaises(store.ConflictError):
             store.create_archive(self.db, "lake", "x.csv", CSV)
+
+    def test_old_schema_migrates_to_ready(self):
+        """A database from before archive.status opens with all rows ready."""
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            old = os.path.join(tmp.name, "old.sqlite3")
+            conn = sqlite3.connect(old)
+            try:
+                conn.executescript(
+                    "CREATE TABLE archive (id INTEGER PRIMARY KEY,"
+                    " name TEXT NOT NULL UNIQUE, source_filename TEXT NOT NULL,"
+                    " layout_json TEXT NOT NULL,"
+                    " created_at TEXT NOT NULL DEFAULT"
+                    " (strftime('%Y-%m-%dT%H:%M:%fZ','now')));"
+                    "CREATE TABLE frame (archive_id INTEGER NOT NULL"
+                    " REFERENCES archive(id) ON DELETE CASCADE,"
+                    " seq INTEGER NOT NULL, sampled_at TEXT NOT NULL,"
+                    " sampled_at_raw TEXT NOT NULL, restored_mc INTEGER NOT NULL,"
+                    " base_seq INTEGER, kind_raw TEXT NOT NULL DEFAULT '',"
+                    " extras_json TEXT NOT NULL DEFAULT '[]',"
+                    " PRIMARY KEY (archive_id, seq),"
+                    " CHECK (base_seq IS NULL OR base_seq < seq),"
+                    " FOREIGN KEY (archive_id, base_seq)"
+                    " REFERENCES frame(archive_id, seq)"
+                    " DEFERRABLE INITIALLY DEFERRED);"
+                    "CREATE TABLE revision (id INTEGER PRIMARY KEY,"
+                    " archive_id INTEGER NOT NULL REFERENCES archive(id)"
+                    " ON DELETE CASCADE, seq INTEGER NOT NULL,"
+                    " old_restored_mc INTEGER NOT NULL, old_base_seq INTEGER,"
+                    " old_stored_kind TEXT NOT NULL, old_stored_mc INTEGER NOT NULL,"
+                    " new_restored_mc INTEGER NOT NULL, new_base_seq INTEGER,"
+                    " new_stored_kind TEXT NOT NULL, new_stored_mc INTEGER NOT NULL,"
+                    " seen_restored_mc INTEGER NOT NULL,"
+                    " submitted_at TEXT NOT NULL DEFAULT"
+                    " (strftime('%Y-%m-%dT%H:%M:%fZ','now')));"
+                    "INSERT INTO archive (name, source_filename, layout_json)"
+                    " VALUES ('legacy','l.csv','{}');"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            store.init_db(old)     # migrates
+            self.assertEqual([a.name for a in store.list_archives(old)], ["legacy"])
+            store.init_db(old)     # idempotent
+            conn = store.connect(old)
+            try:
+                cols = {r["name"] for r in conn.execute("PRAGMA table_info(archive)")}
+                idx = conn.execute("SELECT 1 FROM sqlite_master"
+                                   " WHERE type='index' AND name='archive_ready'")
+                has_index = idx.fetchone() is not None
+                status = conn.execute(
+                    "SELECT status FROM archive WHERE name='legacy'").fetchone()[0]
+            finally:
+                conn.close()
+            self.assertIn("status", cols)
+            self.assertTrue(has_index)
+            self.assertEqual(status, "ready")
+        finally:
+            tmp.cleanup()
 
     def test_bad_csv_rejected(self):
         for payload in (b"", b"a,b\n1,2\n",
@@ -286,6 +349,340 @@ class TestExport(Base):
         out = self.client.get("/archives/%d/download.csv" % aid).data
         self.assertIn(b"\r\n", out)
         self.assertNotIn(b"\n", out.replace(b"\r\n", b""))
+
+
+class TestIncrementalImport(Base):
+    """Large imports must not block or expose themselves mid-flight."""
+
+    def make_rows(self, n, base=1000):
+        lines = ["seq,sampled_at_utc,value_millidegrees_c,kind,base_seq"]
+        for i in range(n):
+            seq = base + i
+            kind = "absolute" if i == 0 else "delta"
+            ref = "" if i == 0 else str(base)
+            lines.append("%d,2024-05-01T00:00:00Z,%d,%s,%s"
+                         % (seq, 100 if i else -1500, kind, ref))
+        return ("\n".join(lines) + "\n").encode()
+
+    def proxy_connect(self, on_commit):
+        """Patch store.connect so ``on_commit(conn, path)`` runs after each COMMIT.
+
+        The test client only sees the public API; the callback models what a
+        second browser window does in the gap between two import batches.
+        """
+
+        class Proxy:
+            def __init__(self, raw, path):
+                self._raw = raw
+                self._path = path
+
+            def execute(self, sql, *args):
+                done = self._raw.execute(sql, *args)
+                if sql.strip().upper() == "COMMIT":
+                    on_commit(self._raw, self._path)
+                return done
+
+            def __getattr__(self, name):
+                return getattr(self._raw, name)
+
+            def close(self):
+                self._raw.close()
+
+        return unittest.mock.patch.object(
+            store, "connect", lambda path: Proxy(store_connect(path), path))
+
+    def test_large_import_is_not_visible_until_complete(self):
+        payload = self.make_rows(store.IMPORT_BATCH_SIZE * 2 + 7)
+        observations = []
+
+        def on_commit(conn, path):
+            status = conn.execute(
+                "SELECT status FROM archive WHERE name = 'big'").fetchone()
+            if status is not None and status["status"] == "importing":
+                observations.append(store.list_archives(path))
+
+        with self.proxy_connect(on_commit):
+            aid = store.create_archive(self.db, "big", "big.csv", payload)
+
+        # Observed after every batch commit, and never listed while incomplete.
+        self.assertGreaterEqual(len(observations), 4)
+        for listed in observations:
+            self.assertNotIn("big", [a.name for a in listed])
+
+        summary = store.get_archive(self.db, aid)
+        self.assertEqual(summary.frame_count, store.IMPORT_BATCH_SIZE * 2 + 7)
+        self.assertEqual(len(store.list_frames(self.db, aid)), summary.frame_count)
+
+    def test_importing_archive_hidden_from_every_read_path(self):
+        payload = self.make_rows(store.IMPORT_BATCH_SIZE + 5)
+        probes = []
+        probing = []
+
+        def on_commit(conn, path):
+            if probing:
+                return          # a reader's own COMMIT must not re-enter
+            row = conn.execute(
+                "SELECT id, status FROM archive WHERE name = 'pending'").fetchone()
+            if row is None or row["status"] != "importing":
+                return
+            probes.append(row["id"])
+            probing.append(True)
+            try:
+                for reader in (store.get_archive, store.list_frames,
+                               store.export_csv):
+                    with self.assertRaises(store.ArchiveError) as ctx:
+                        reader(path, row["id"])
+                    self.assertEqual(ctx.exception.status, 404)
+                with self.assertRaises(store.ArchiveError) as ctx:
+                    store.get_frame(path, row["id"], 1000)
+                self.assertEqual(ctx.exception.status, 404)
+                with self.assertRaises(store.ArchiveError) as ctx:
+                    store.correct_frame(path, row["id"], 1000,
+                                        seen_restored_mc=-1500,
+                                        new_restored_mc=-1400)
+                self.assertEqual(ctx.exception.status, 404)
+            finally:
+                probing.pop()
+
+        with self.proxy_connect(on_commit):
+            store.create_archive(self.db, "pending", "p.csv", payload)
+        self.assertTrue(probes, "the import must have been probed mid-flight")
+
+        # Nothing was written by the rejected correction.
+        conn = store_connect(self.db)
+        try:
+            n = conn.execute("SELECT COUNT(*) FROM revision").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(n, 0)
+
+    def test_correction_during_import_commits_and_survives(self):
+        """A correction to an existing archive lands while a new one imports."""
+        payload = self.make_rows(store.IMPORT_BATCH_SIZE * 2 + 3)
+        corrected = []
+        busy = []
+
+        def on_commit(conn, path):
+            if corrected or busy:
+                return
+            row = conn.execute(
+                "SELECT status FROM archive WHERE name = 'big'").fetchone()
+            if row is not None and row["status"] == "importing":
+                # A second browser window corrects an older archive; the
+                # import must have released the write lock between batches.
+                busy.append(True)
+                try:
+                    corrected.append(store.correct_frame(
+                        path, self.aid, 2,
+                        seen_restored_mc=-1250, new_restored_mc=-900))
+                finally:
+                    busy.pop()
+
+        with self.proxy_connect(on_commit):
+            aid = store.create_archive(self.db, "big", "big.csv", payload)
+
+        self.assertTrue(corrected)
+        f = store.get_frame(self.db, self.aid, 2)
+        self.assertEqual(f.restored_mc, -900)
+        # The new archive finished correctly despite the interleaved write.
+        self.assertEqual(store.get_archive(self.db, aid).frame_count,
+                         store.IMPORT_BATCH_SIZE * 2 + 3)
+        self.assertEqual(store.export_csv(self.db, aid).count(b"\n"),
+                         store.IMPORT_BATCH_SIZE * 2 + 4)
+
+    def test_failed_import_cleans_up_and_allows_retry(self):
+        payload = self.make_rows(store.IMPORT_BATCH_SIZE * 2 + 5)
+        state = {"commits": 0}
+
+        class FailingConn:
+            """Proxy that fails the Nth COMMIT, leaving earlier batches written."""
+
+            def __init__(self, inner):
+                self.raw = inner
+
+            def execute(self, sql, *args):
+                if sql.strip().upper() == "COMMIT":
+                    state["commits"] += 1
+                    if state["commits"] == 3:      # after rows are committed
+                        raise sqlite3.OperationalError("simulated commit failure")
+                return self.raw.execute(sql, *args)
+
+            def __getattr__(self, name):
+                return getattr(self.raw, name)
+
+            def close(self):
+                self.raw.close()
+
+        with unittest.mock.patch.object(
+                store, "connect", lambda p: FailingConn(store_connect(p))):
+            with self.assertRaises(sqlite3.OperationalError):
+                store.create_archive(self.db, "doomed", "d.csv", payload)
+
+        # The half-written archive is gone, including its frame rows, and the
+        # name is free again.
+        names = [a.name for a in store.list_archives(self.db)]
+        self.assertNotIn("doomed", names)
+        conn = store_connect(self.db)
+        try:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM archive WHERE name='doomed'")
+                .fetchone()[0], 0)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM frame WHERE archive_id NOT IN"
+                             " (SELECT id FROM archive)").fetchone()[0], 0)
+        finally:
+            conn.close()
+
+        # An earlier correction to another archive survived the failure.
+        self.assertEqual(store.get_frame(self.db, self.aid, 2).restored_mc, -1250)
+
+        # Re-uploading under the same name now succeeds.
+        aid = store.create_archive(self.db, "doomed", "d.csv", payload)
+        self.assertEqual(store.get_archive(self.db, aid).frame_count,
+                         store.IMPORT_BATCH_SIZE * 2 + 5)
+
+    def test_failed_import_keeps_committed_corrections(self):
+        """A correction committed before a failed import is not rolled back."""
+        payload = self.make_rows(store.IMPORT_BATCH_SIZE * 2 + 2)
+        state = {"n": 0, "corrected": False, "busy": False}
+
+        class FailingConn:
+            def __init__(self, raw, path):
+                self._raw = raw
+                self._path = path
+
+            def execute(self, sql, *args):
+                if sql.strip().upper() == "COMMIT" and not state["busy"]:
+                    state["n"] += 1
+                    # #1 archive row, #2..#4 frame batches, #5 status flip:
+                    # commit several batches, then fail on the closing one.
+                    if state["n"] == 5:
+                        raise sqlite3.OperationalError("simulated failure")
+                return self._raw.execute(sql, *args)
+
+            def __getattr__(self, name):
+                return getattr(self._raw, name)
+
+            def close(self):
+                self._raw.close()
+
+        def on_commit(conn, path):
+            if state["corrected"]:
+                return
+            state["corrected"] = True
+            state["busy"] = True
+            try:
+                # A second window's correction is committed between batches of
+                # the doomed import.  Cleanup must not touch it.
+                store.correct_frame(path, self.aid, 1,
+                                    seen_restored_mc=-1500, new_restored_mc=-2000)
+            finally:
+                state["busy"] = False
+
+        with unittest.mock.patch.object(store, "IMPORT_BATCH_SIZE", 2):
+            # Layer the commit hook under the commit counter so both see the
+            # import's own commits, in the order they happen.
+            with self.proxy_connect(on_commit):
+                proxied = store.connect
+                with unittest.mock.patch.object(
+                        store, "connect",
+                        lambda p: FailingConn(proxied(p), p)):
+                    with self.assertRaises(sqlite3.OperationalError):
+                        store.create_archive(self.db, "doomed2", "d.csv", payload)
+
+        self.assertNotIn("doomed2", [a.name for a in store.list_archives(self.db)])
+        self.assertEqual(store.get_frame(self.db, self.aid, 1).restored_mc, -2000)
+
+    def test_failed_upload_shows_clean_message(self):
+        """A storage failure during an HTTP upload is a friendly 500 page."""
+        payload = self.make_rows(store.IMPORT_BATCH_SIZE + 3)
+        state = {"n": 0}
+
+        class FailingConn:
+            def __init__(self, raw):
+                self._raw = raw
+
+            def execute(self, sql, *args):
+                if sql.strip().upper() == "COMMIT":
+                    state["n"] += 1
+                    if state["n"] == 3:
+                        raise sqlite3.OperationalError("disk full")
+                return self._raw.execute(sql, *args)
+
+            def __getattr__(self, name):
+                return getattr(self._raw, name)
+
+            def close(self):
+                self._raw.close()
+
+        with unittest.mock.patch.object(
+                store, "connect", lambda p: FailingConn(store_connect(p))):
+            r = self.client.post(
+                "/archives",
+                data={"name": "broken", "file": (io.BytesIO(payload), "b.csv")},
+                content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 500)
+        page = r.data.decode()
+        self.assertIn("已清理", page)
+        self.assertNotIn("Traceback", page)
+        self.assertNotIn("broken", [a.name for a in store.list_archives(self.db)])
+        # and the same name can be uploaded again
+        r2 = self.client.post(
+            "/archives",
+            data={"name": "broken", "file": (io.BytesIO(payload), "b.csv")},
+            content_type="multipart/form-data")
+        self.assertEqual(r2.status_code, 302)
+
+    def test_stale_import_swept_on_startup(self):
+        conn = store_connect(self.db)
+        try:
+            # One abandoned long ago, one just started (possibly a live import
+            # in another process -- must be left alone).
+            with store._transaction(conn):
+                conn.execute(
+                    "INSERT INTO archive (name, source_filename, layout_json,"
+                    " status, created_at) VALUES ('dead', 'x.csv', '{}',"
+                    " 'importing', '2020-01-01T00:00:00Z')")
+                conn.execute(
+                    "INSERT INTO archive (name, source_filename, layout_json, status)"
+                    " VALUES ('live-elsewhere', 'x.csv', '{}', 'importing')")
+                conn.execute(
+                    "INSERT INTO archive (name, source_filename, layout_json, status)"
+                    " VALUES ('done', 'x.csv', '{}', 'ready')")
+        finally:
+            conn.close()
+        store.init_db(self.db)   # what a fresh app start does
+        conn = store.connect(self.db)
+        try:
+            names = {r["name"]: r["status"] for r in
+                     conn.execute("SELECT name, status FROM archive")}
+        finally:
+            conn.close()
+        self.assertNotIn("dead", names)
+        self.assertEqual(names.get("live-elsewhere"), "importing")
+        self.assertEqual(names.get("done"), "ready")
+        # ...and the abandoned name may be reused immediately.
+        store.create_archive(
+            self.db, "dead", "x.csv",
+            b"seq,sampled_at_utc,value_millidegrees_c\n1,2024-01-01T00:00:00Z,1\n")
+
+    def test_duplicate_name_still_rejected_mid_import(self):
+        payload = self.make_rows(store.IMPORT_BATCH_SIZE + 1)
+        attempts = []
+
+        def on_commit(conn, path):
+            if attempts:
+                return
+            row = conn.execute(
+                "SELECT status FROM archive WHERE name = 'dupe'").fetchone()
+            if row is not None and row["status"] == "importing":
+                attempts.append(row["status"])
+                with self.assertRaises(store.ConflictError):
+                    store.create_archive(path, "dupe", "d.csv", payload)
+
+        with self.proxy_connect(on_commit):
+            store.create_archive(self.db, "dupe", "d.csv", payload)
+        self.assertTrue(attempts)
 
 
 class TestPages(Base):

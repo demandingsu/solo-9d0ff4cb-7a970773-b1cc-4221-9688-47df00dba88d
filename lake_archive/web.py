@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 
 from flask import Flask, Response, abort, redirect, request, url_for
 
@@ -47,6 +48,13 @@ def create_app(db_path: str | None = None) -> Flask:
             return index_response("CSV 无法导入：%s" % exc, "bad", 400)
         except store.ArchiveError as exc:
             return index_response(exc.message, "bad", exc.status)
+        except sqlite3.Error as exc:
+            # create_archive has already removed this import's partial rows,
+            # so the same name can be uploaded again right away.
+            app.logger.exception("import failed for %r", name)
+            return index_response(
+                "导入失败，未完成的档案已清理，可用同一名称重传。"
+                "（数据库错误：%s）" % exc, "bad", 500)
         return redirect(url_for("show_archive", archive_id=archive_id,
                                 notice="已导入档案。"))
 

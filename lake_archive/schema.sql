@@ -1,12 +1,22 @@
 PRAGMA foreign_keys = ON;
 
+-- An archive is written frame batch by frame batch.  While it is being
+-- imported its status is 'importing' and it is invisible to every public
+-- read, correction and download path.  The final transaction flips the
+-- status to ready.  A failed import is deleted (frame rows cascade), which
+-- also releases its name for a retry.
 CREATE TABLE IF NOT EXISTS archive (
     id              INTEGER PRIMARY KEY,
     name            TEXT    NOT NULL UNIQUE,
     source_filename TEXT    NOT NULL,
     layout_json     TEXT    NOT NULL,
+    status          TEXT    NOT NULL DEFAULT 'ready'
+                    CHECK (status IN ('importing', 'ready')),
     created_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- Every public listing filters on status = 'ready'.
+CREATE INDEX IF NOT EXISTS archive_ready ON archive (status, id);
 
 -- One row per frame of a recorder CSV.
 --

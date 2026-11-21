@@ -39,6 +39,19 @@ from . import csvio
 
 _SCHEMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")
 
+# Frames are inserted in batches of this size.  Each batch is its own short
+# ``BEGIN IMMEDIATE`` transaction, so between batches the database write lock
+# is free and corrections to other archives proceed normally while a large
+# import is still running.  The archive row stays ``importing`` -- and thus
+# invisible -- until the very last batch has been committed.
+IMPORT_BATCH_SIZE = 200
+
+# An ``importing`` archive older than this is presumed abandoned by a killed
+# process and is swept at start-up.  Young ones are left alone so that a
+# second process starting against the same database never deletes a live
+# import (a large upload takes seconds to minutes, not hours).
+STALE_IMPORT_AFTER_HOURS = 1
+
 
 class ArchiveError(Exception):
     """Domain error carrying an HTTP status code for the UI."""
@@ -89,10 +102,53 @@ def init_db(db_path: str) -> None:
     conn = connect(db_path)
     try:
         conn.execute("PRAGMA journal_mode = WAL")
+        # Migrate first: schema.sql creates the index on archive.status, which
+        # a pre-migration database lacks the column for.
+        _migrate(conn)
         with open(_SCHEMA_PATH, "r", encoding="utf-8") as fh:
             conn.executescript(fh.read())
+        _sweep_stale_imports(conn)
     finally:
         conn.close()
+
+
+def _sweep_stale_imports(conn: sqlite3.Connection) -> None:
+    """Remove archives left half-written by a previously crashed process.
+
+    ``create_archive`` cleans up after any exception, so only a killed process
+    can leave an ``importing`` row behind.  The age guard matters when more
+    than one process serves the same database: a process starting up must not
+    delete an import another process is actively running.  A row is therefore
+    only swept once it has been importing for longer than
+    ``STALE_IMPORT_AFTER_HOURS``; it is invisible in the meantime, so leaving
+    a young one alone costs nothing.
+    """
+    with _transaction(conn):
+        conn.execute(
+            "DELETE FROM archive WHERE status = 'importing'"
+            " AND julianday('now') - julianday(created_at) > ?",
+            (STALE_IMPORT_AFTER_HOURS / 24.0,),
+        )
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring a database created by an older schema up to date.
+
+    The only change to the schema so far is ``archive.status``; databases
+    made before it hold only fully imported archives, so the column is added
+    with the ``ready`` default.  On a fresh database there is nothing to do --
+    schema.sql creates the table with the column already present.
+    """
+    if conn.execute("SELECT 1 FROM sqlite_master"
+                    " WHERE type = 'table' AND name = 'archive'").fetchone() is None:
+        return
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(archive)")}
+    if "status" not in columns:
+        with _transaction(conn):
+            conn.execute(
+                "ALTER TABLE archive ADD COLUMN status TEXT NOT NULL"
+                " DEFAULT 'ready' CHECK (status IN ('importing', 'ready'))"
+            )
 
 
 @contextmanager
@@ -141,7 +197,19 @@ def _fetch_base_restored(conn, archive_id: int, base_seq: int | None) -> int | N
 
 
 def create_archive(db_path: str, name: str, filename: str, payload: bytes) -> int:
-    """Import a logger CSV as a new archive; returns the archive id."""
+    """Import a logger CSV as a new archive; returns the archive id.
+
+    The archive is row-visible as ``importing`` from the first committed batch
+    on, but every public read filters it out until the closing transaction
+    sets ``ready``.  Committing batch by batch keeps the SQLite write lock
+    free between batches, so corrections to *other* archives are not held up
+    by a large import.
+
+    If any step fails, this import's own rows are deleted (a correction to
+    some other archive is a separate committed transaction and is untouched),
+    then the error is re-raised.  Deleting the archive row frees its unique
+    name for an immediate retry.
+    """
     rows, layout = csvio.parse_csv(payload)
     restored: dict[int, int] = {}
     for fr in rows:  # ordered by seq, and base_seq < seq
@@ -151,12 +219,13 @@ def create_archive(db_path: str, name: str, filename: str, payload: bytes) -> in
             restored[fr.seq] = fr.stored_mc + restored[fr.base_seq]
 
     conn = connect(db_path)
+    archive_id: int | None = None
     try:
         with _transaction(conn):
             try:
                 cur = conn.execute(
-                    "INSERT INTO archive (name, source_filename, layout_json)"
-                    " VALUES (?, ?, ?)",
+                    "INSERT INTO archive (name, source_filename, layout_json, status)"
+                    " VALUES (?, ?, ?, 'importing')",
                     (name, filename, layout.to_json()),
                 )
             except sqlite3.IntegrityError as exc:
@@ -165,17 +234,52 @@ def create_archive(db_path: str, name: str, filename: str, payload: bytes) -> in
                         "an archive named %r already exists" % name) from exc
                 raise
             archive_id = cur.lastrowid
-            conn.executemany(
-                "INSERT INTO frame (archive_id, seq, sampled_at, sampled_at_raw,"
-                " restored_mc, base_seq, kind_raw, extras_json)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                [(archive_id, fr.seq, fr.sampled_at, fr.sampled_at_raw,
-                  restored[fr.seq], fr.base_seq, fr.kind_raw,
-                  json.dumps(list(fr.extras), ensure_ascii=False)) for fr in rows],
+
+        for start in range(0, len(rows), IMPORT_BATCH_SIZE):
+            batch = rows[start:start + IMPORT_BATCH_SIZE]
+            with _transaction(conn):
+                conn.executemany(
+                    "INSERT INTO frame (archive_id, seq, sampled_at, sampled_at_raw,"
+                    " restored_mc, base_seq, kind_raw, extras_json)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [(archive_id, fr.seq, fr.sampled_at, fr.sampled_at_raw,
+                      restored[fr.seq], fr.base_seq, fr.kind_raw,
+                      json.dumps(list(fr.extras), ensure_ascii=False)) for fr in batch],
+                )
+
+        # The closing batch is the moment the archive becomes usable: listing,
+        # frame lookup, correction and download all see it in this one commit.
+        with _transaction(conn):
+            conn.execute(
+                "UPDATE archive SET status = 'ready' WHERE id = ?", (archive_id,)
             )
         return archive_id
+    except BaseException:
+        _discard_import(conn, archive_id)
+        raise
     finally:
         conn.close()
+
+
+def _discard_import(conn: sqlite3.Connection, archive_id: int | None) -> None:
+    """Delete a partially imported archive and everything already written.
+
+    Runs as its own transaction; ``ON DELETE CASCADE`` removes its frame
+    rows.  Failures here must not mask the original import error, so they are
+    swallowed -- a leftover ``importing`` archive is never visible through the
+    UI and keeps its name reserved only until cleanup succeeds.
+    """
+    if archive_id is None:
+        return
+    try:
+        # A failed COMMIT can leave the transaction open, in which case a new
+        # BEGIN would itself fail; roll it back before cleaning up.
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        with _transaction(conn):
+            conn.execute("DELETE FROM archive WHERE id = ?", (archive_id,))
+    except sqlite3.Error:
+        pass
 
 
 def list_archives(db_path: str) -> list[ArchiveSummary]:
@@ -184,6 +288,7 @@ def list_archives(db_path: str) -> list[ArchiveSummary]:
         rows = conn.execute(
             "SELECT a.id, a.name, a.source_filename, a.created_at, COUNT(f.seq) AS n"
             " FROM archive a LEFT JOIN frame f ON f.archive_id = a.id"
+            " WHERE a.status = 'ready'"
             " GROUP BY a.id ORDER BY a.id"
         ).fetchall()
         return [
@@ -197,7 +302,10 @@ def list_archives(db_path: str) -> list[ArchiveSummary]:
 
 
 def _archive_row(conn, archive_id: int) -> sqlite3.Row:
-    row = conn.execute("SELECT * FROM archive WHERE id = ?", (archive_id,)).fetchone()
+    """Fetch a *ready* archive; one still importing is reported as absent."""
+    row = conn.execute(
+        "SELECT * FROM archive WHERE id = ? AND status = 'ready'", (archive_id,)
+    ).fetchone()
     if row is None:
         raise ArchiveError("archive not found", status=404)
     return row
